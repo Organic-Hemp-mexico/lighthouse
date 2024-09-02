@@ -1,7 +1,7 @@
 /**
- * @license
- * Copyright 2022 Google LLC
- * SPDX-License-Identifier: Apache-2.0
+ * @license Copyright 2022 The Lighthouse Authors. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
 
 import {EntityClassification} from '../../computed/entity-classification.js';
@@ -15,6 +15,7 @@ function mockArtifacts(networkRecords) {
       mainDocumentUrl: networkRecords[0].url,
       finalDisplayedUrl: networkRecords[0].url,
     },
+    budgets: null,
   };
 }
 
@@ -35,11 +36,9 @@ describe('Entity Classification computed artifact', () => {
   it('computes entity classification for all urls in devtoolsLogs', async () => {
     const result = await EntityClassification.request(artifacts, context);
     // Make sure classification was successful.
-    expect(result).toHaveProperty('entityByUrl');
     expect(result).toHaveProperty('urlsByEntity');
     expect(result).toHaveProperty('firstParty');
     // Make sure all entities have been identified.
-    expect(result.entityByUrl.size).toBe(4);
     expect(result.urlsByEntity.size).toBe(2);
     // Make sure first party is one of the entities.
     expect(result.urlsByEntity.keys()).toContainEqual(result.firstParty);
@@ -48,7 +47,16 @@ describe('Entity Classification computed artifact', () => {
     expect(result.isFirstParty).toBeInstanceOf(Function);
     expect(result.isFirstParty('http://example.com/file.html')).toEqual(true);
     expect(result.isFirstParty('http://cdn.example.com/script.js')).toEqual(true);
+    expect(result.isFirstParty('http://example.com/unidentified.jpg')).toEqual(true);
     expect(result.isFirstParty('http://third-party.com/file.jpg')).toEqual(false);
+
+    expect(result.getEntity).toBeInstanceOf(Function);
+    expect(result.getEntity('http://example.com/file.html')).toMatchObject({
+      name: 'example.com',
+    });
+    expect(result.getEntity('http://example.com/file.html')).toEqual(
+      result.getEntity('http://example.com/unidentified.jpg')
+    );
   });
 
   it('identifies 1st party URL given finalDisplayedUrl', async () => {
@@ -63,7 +71,6 @@ describe('Entity Classification computed artifact', () => {
     expect(result.firstParty.name).toBe('example.com');
     // Make sure all entities were identified..
     expect(entities).toEqual(['example.com', 'third-party.com']);
-    expect(result.entityByUrl.size).toBe(4);
   });
 
   it('identifies 1st party URL given mainDocumentUrl', async () => {
@@ -77,18 +84,12 @@ describe('Entity Classification computed artifact', () => {
     expect(result.firstParty.name).toBe('example.com');
     // Make sure all entities were identified.
     expect(entities).toEqual(['example.com', 'third-party.com']);
-    expect(result.entityByUrl.size).toBe(4);
   });
 
-  it('does not identify 1st party if URL artifact is missing', async () => {
+  it('throws if URL artifact is missing', async () => {
     artifacts.URL = {};
-    const result = await EntityClassification.request(artifacts, context);
-    const entities = Array.from(result.urlsByEntity.keys()).map(e => e.name);
-    // Make sure first party is not identified.
-    expect(result.firstParty).toBeFalsy();
-    // Make sure all entities were identified.
-    expect(entities).toEqual(['example.com', 'third-party.com']);
-    expect(result.entityByUrl.size).toBe(4);
+    const resultPromise = EntityClassification.request(artifacts, context);
+    await expect(resultPromise).rejects.toThrow();
   });
 
   it('prioritizes mainDocumentUrl over finalDisplayUrl when both are available', async () => {
@@ -103,7 +104,6 @@ describe('Entity Classification computed artifact', () => {
     expect(result.firstParty.name).toBe('third-party.com');
     // Make sure all entities were identified.
     expect(entities).toEqual(['example.com', 'third-party.com']);
-    expect(result.entityByUrl.size).toBe(4);
   });
 
   it('does not classify non-network URLs', async () => {
@@ -121,59 +121,7 @@ describe('Entity Classification computed artifact', () => {
     expect(result.firstParty.name).toBe('third-party.com');
     // Make sure only valid network urls with a domain is recognized.
     expect(entities).toEqual(['third-party.com']);
-    expect(result.entityByUrl.size).toBe(1);
-    // First party check returns false for non-DT-log URLs.
-    expect(result.isFirstParty('chrome://version')).toEqual(false);
-  });
-
-  it('classifies chrome-extension URLs and resolves their names', async () => {
-    artifacts.URL = {
-      mainDocumentUrl: 'http://third-party.com',
-    };
-    artifacts.devtoolsLog = networkRecordsToDevtoolsLog([
-      {url: 'http://third-party.com'},
-      {url: 'data:foobar'},
-      {'url': 'chrome-extension://abcdefghijklmnopqrstuvwxyz/foo/bar.js'},
-      {'url': 'chrome-extension://nonresolvablechromextension/bar/baz.js'},
-    ]);
-
-    // Inject an executionContextCreated entry to resolve extension names
-    artifacts.devtoolsLog.push({
-      method: 'Runtime.executionContextCreated',
-      params: {
-        context: {
-          origin: 'chrome-extension://abcdefghijklmnopqrstuvwxyz',
-          name: 'Sample Chrome Extension',
-        },
-      },
-    });
-
-    const result = await EntityClassification.request(artifacts, context);
-    const entities = Array.from(result.urlsByEntity.keys()).map(e => e.name);
-    // Make sure first party is identified.
-    expect(result.firstParty.name).toBe('third-party.com');
-    // Make sure only valid network urls with a domain is recognized.
-    expect(entities).toEqual(['third-party.com', 'Sample Chrome Extension',
-      'nonresolvablechromextension']);
-
-    const extensionEntity = result.entityByUrl
-      .get('chrome-extension://abcdefghijklmnopqrstuvwxyz/foo/bar.js');
-    expect(extensionEntity).toHaveProperty('category', 'Chrome Extension');
-    expect(extensionEntity).toHaveProperty('name', 'Sample Chrome Extension');
-    expect(extensionEntity).toHaveProperty('homepage',
-      'https://chromewebstore.google.com/detail/abcdefghijklmnopqrstuvwxyz');
-
-    const extensionUnknownEntity = result.entityByUrl
-      .get('chrome-extension://nonresolvablechromextension/bar/baz.js');
-    expect(extensionUnknownEntity).toHaveProperty('category', 'Chrome Extension');
-    expect(extensionUnknownEntity).toHaveProperty('name', 'nonresolvablechromextension');
-    expect(extensionUnknownEntity).toHaveProperty('homepage',
-      'https://chromewebstore.google.com/detail/nonresolvablechromextension');
-
-    expect(result.entityByUrl.size).toBe(3);
-    // First party check fails for non-DT-log URLs.
-    expect(result.isFirstParty('chrome-extension://abcdefghijklmnopqrstuvwxyz/foo/bar.js'))
-      .toEqual(false);
-    expect(result.isFirstParty('chrome://new-tab-page')).toEqual(false);
+    // A non network url will never be first party.
+    expect(result.isFirstParty('chrome://version')).toBeFalsy();
   });
 });
