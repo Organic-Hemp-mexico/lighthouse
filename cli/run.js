@@ -1,53 +1,38 @@
 /**
- * @license
- * Copyright 2017 Google LLC
- * SPDX-License-Identifier: Apache-2.0
+ * @license Copyright 2017 Google Inc. All Rights Reserved.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
+'use strict';
 
 /* eslint-disable no-console */
 
-import path from 'path';
-import os from 'os';
+const path = require('path');
 
-import * as ChromeLauncher from 'chrome-launcher';
-import yargsParser from 'yargs-parser';
-import log from 'lighthouse-logger';
-import open from 'open';
+const Printer = require('./printer.js');
+const ChromeLauncher = require('chrome-launcher');
 
-import * as Printer from './printer.js';
-import lighthouse from '../core/index.js';
-import {getLhrFilenamePrefix} from '../report/generator/file-namer.js';
-import * as assetSaver from '../core/lib/asset-saver.js';
-import UrlUtils from '../core/lib/url-utils.js';
+const yargsParser = require('yargs-parser');
+const lighthouse = require('../lighthouse-core/index.js');
+const log = require('lighthouse-logger');
+const getFilenamePrefix = require('../lighthouse-core/lib/file-namer.js').getFilenamePrefix;
+const assetSaver = require('../lighthouse-core/lib/asset-saver.js');
 
-/** @typedef {Error & {code: string, friendlyMessage?: string}} ExitError */
+const opn = require('opn');
 
 const _RUNTIME_ERROR_CODE = 1;
 const _PROTOCOL_TIMEOUT_EXIT_CODE = 67;
+const _PAGE_HUNG_EXIT_CODE = 68;
+const _INSECURE_DOCUMENT_REQUEST_EXIT_CODE = 69;
 
 /**
  * exported for testing
- * @param {string|Array<string>} flags
+ * @param {string} flags
  * @return {Array<string>}
  */
 function parseChromeFlags(flags = '') {
-  // flags will be a string if there is only one chrome-flag parameter:
-  // i.e. `lighthouse --chrome-flags="--user-agent='My Agent' --headless"`
-  // flags will be an array if there are multiple chrome-flags parameters
-  // i.e. `lighthouse --chrome-flags="--user-agent='My Agent'" --chrome-flags="--headless"`
-  const trimmedFlags = (Array.isArray(flags) ? flags : [flags])
-      // `child_process.execFile` and other programmatic invocations will pass Lighthouse arguments atomically.
-      // Many developers aren't aware of this and attempt to pass arguments to LH as they would to a shell `--chromeFlags="--headless --no-sandbox"`.
-      // In this case, yargs will see `"--headless --no-sandbox"` and treat it as a single argument instead of the intended `--headless --no-sandbox`.
-      // We remove quotes that surround the entire expression to make this work.
-      // i.e. `child_process.execFile("lighthouse", ["http://google.com", "--chrome-flags='--headless --no-sandbox'")`
-      // the following regular expression removes those wrapping quotes:
-      .map((flagsGroup) => flagsGroup.replace(/^\s*('|")(.+)\1\s*$/, '$2').trim())
-      .join(' ').trim();
-
-  const parsed = yargsParser(trimmedFlags, {
-    configuration: {'camel-case-expansion': false, 'boolean-negation': false},
-  });
+  const parsed = yargsParser(
+      flags.trim(), {configuration: {'camel-case-expansion': false, 'boolean-negation': false}});
 
   return Object
       .keys(parsed)
@@ -70,43 +55,42 @@ function parseChromeFlags(flags = '') {
  * @return {Promise<ChromeLauncher.LaunchedChrome>}
  */
 function getDebuggableChrome(flags) {
-  if (process.platform === 'darwin' && process.arch === 'x64') {
-    const cpus = os.cpus();
-    if (cpus[0].model.includes('Apple')) {
-      throw new Error(
-        'Launching Chrome on Mac Silicon (arm64) from an x64 Node installation results in ' +
-        'Rosetta translating the Chrome binary, even if Chrome is already arm64. This would ' +
-        'result in huge performance issues. To resolve this, you must run Lighthouse CLI with ' +
-        'a version of Node built for arm64. You should also confirm that your Chrome install ' +
-        'says arm64 in chrome://version');
-    }
-  }
-
   return ChromeLauncher.launch({
     port: flags.port,
-    ignoreDefaultFlags: flags.chromeIgnoreDefaultFlags,
     chromeFlags: parseChromeFlags(flags.chromeFlags),
     logLevel: flags.logLevel,
   });
 }
 
 /** @return {never} */
-function printConnectionErrorAndExit() {
+function showConnectionError() {
   console.error('Unable to connect to Chrome');
   return process.exit(_RUNTIME_ERROR_CODE);
 }
 
 /** @return {never} */
-function printProtocolTimeoutErrorAndExit() {
+function showProtocolTimeoutError() {
   console.error('Debugger protocol timed out while connecting to Chrome.');
   return process.exit(_PROTOCOL_TIMEOUT_EXIT_CODE);
 }
 
+/** @param {LH.LighthouseError} err @return {never} */
+function showPageHungError(err) {
+  console.error('Page hung:', err.friendlyMessage);
+  return process.exit(_PAGE_HUNG_EXIT_CODE);
+}
+
+/** @param {LH.LighthouseError} err @return {never} */
+function showInsecureDocumentRequestError(err) {
+  console.error('Insecure document request:', err.friendlyMessage);
+  return process.exit(_INSECURE_DOCUMENT_REQUEST_EXIT_CODE);
+}
+
 /**
- * @param {ExitError} err
+ * @param {LH.LighthouseError} err
  * @return {never}
  */
-function printRuntimeErrorAndExit(err) {
+function showRuntimeError(err) {
   console.error('Runtime error encountered:', err.friendlyMessage || err.message);
   if (err.stack) {
     console.error(err.stack);
@@ -115,16 +99,20 @@ function printRuntimeErrorAndExit(err) {
 }
 
 /**
- * @param {ExitError} err
+ * @param {LH.LighthouseError} err
  * @return {never}
  */
-function printErrorAndExit(err) {
+function handleError(err) {
   if (err.code === 'ECONNREFUSED') {
-    return printConnectionErrorAndExit();
+    return showConnectionError();
   } else if (err.code === 'CRI_TIMEOUT') {
-    return printProtocolTimeoutErrorAndExit();
+    return showProtocolTimeoutError();
+  } else if (err.code === 'PAGE_HUNG') {
+    return showPageHungError(err);
+  } else if (err.code === 'INSECURE_DOCUMENT_REQUEST') {
+    return showInsecureDocumentRequestError(err);
   } else {
-    return printRuntimeErrorAndExit(err);
+    return showRuntimeError(err);
   }
 }
 
@@ -148,7 +136,7 @@ async function saveResults(runnerResult, flags) {
   // Use the output path as the prefix for all generated files.
   // If no output path is set, generate a file prefix using the URL and date.
   const configuredPath = !flags.outputPath || flags.outputPath === 'stdout' ?
-      getLhrFilenamePrefix(lhr) :
+      getFilenamePrefix(lhr) :
       flags.outputPath.replace(/\.\w{2,4}$/, '');
   const resolvedPath = path.resolve(cwd, configuredPath);
 
@@ -166,7 +154,7 @@ async function saveResults(runnerResult, flags) {
 
     if (outputType === Printer.OutputMode[Printer.OutputMode.html]) {
       if (flags.view) {
-        open(outputPath, {wait: false});
+        opn(outputPath, {wait: false});
       } else {
         // eslint-disable-next-line max-len
         log.log('CLI', 'Protip: Run lighthouse with `--view` to immediately open the HTML report in your browser');
@@ -176,17 +164,35 @@ async function saveResults(runnerResult, flags) {
 }
 
 /**
+ * Attempt to kill the launched Chrome, if defined.
+ * @param {ChromeLauncher.LaunchedChrome=} launchedChrome
+ * @return {Promise<void>}
+ */
+async function potentiallyKillChrome(launchedChrome) {
+  if (!launchedChrome) return;
+
+  return Promise.race([
+    launchedChrome.kill(),
+    new Promise((_, reject) => setTimeout(reject, 5000, 'Timed out.')),
+  ]).catch(err => {
+    throw new Error(`Couldn't quit Chrome process. ${err}`);
+  });
+}
+
+/**
  * @param {string} url
  * @param {LH.CliFlags} flags
- * @param {LH.Config|undefined} config
+ * @param {LH.Config.Json|undefined} config
  * @return {Promise<LH.RunnerResult|undefined>}
  */
 async function runLighthouse(url, flags, config) {
   /** @param {any} reason */
-  function handleTheUnhandled(reason) {
+  async function handleTheUnhandled(reason) {
     process.stderr.write(`Unhandled Rejection. Reason: ${reason}\n`);
-    launchedChrome?.kill();
-    process.exit(1);
+    await potentiallyKillChrome(launchedChrome).catch(() => {});
+    setTimeout(_ => {
+      process.exit(1);
+    }, 100);
   }
   process.on('unhandledRejection', handleTheUnhandled);
 
@@ -194,18 +200,11 @@ async function runLighthouse(url, flags, config) {
   let launchedChrome;
 
   try {
-    if (url && flags.auditMode && !flags.gatherMode) {
-      log.warn('CLI', 'URL parameter is ignored if -A flag is used without -G flag');
-    }
-
     const shouldGather = flags.gatherMode || flags.gatherMode === flags.auditMode;
-    const shouldUseLocalChrome = UrlUtils.isLikeLocalhost(flags.hostname);
-    if (shouldGather && shouldUseLocalChrome) {
+    if (shouldGather) {
       launchedChrome = await getDebuggableChrome(flags);
       flags.port = launchedChrome.port;
     }
-
-    flags.channel = 'cli';
 
     const runnerResult = await lighthouse(url, flags, config);
 
@@ -214,30 +213,21 @@ async function runLighthouse(url, flags, config) {
       await saveResults(runnerResult, flags);
     }
 
-    launchedChrome?.kill();
+    await potentiallyKillChrome(launchedChrome);
     process.removeListener('unhandledRejection', handleTheUnhandled);
 
-    // Runtime errors indicate something was *very* wrong with the page result.
-    // We don't want the user to have to parse the report to figure it out, so we'll still exit
-    // with an error code after we saved the results.
-    if (runnerResult?.lhr.runtimeError) {
-      const {runtimeError} = runnerResult.lhr;
-      return printErrorAndExit({
-        name: 'LighthouseError',
-        friendlyMessage: runtimeError.message,
-        code: runtimeError.code,
-        message: runtimeError.message,
-      });
+    if (runnerResult && runnerResult.lhr.runtimeError) {
+      throw Error(runnerResult.lhr.runtimeError.message);
     }
 
     return runnerResult;
   } catch (err) {
-    launchedChrome?.kill();
-    return printErrorAndExit(err);
+    await potentiallyKillChrome(launchedChrome).catch(() => {});
+    handleError(err);
   }
 }
 
-export {
+module.exports = {
   parseChromeFlags,
   saveResults,
   runLighthouse,
